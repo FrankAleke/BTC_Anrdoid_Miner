@@ -47,6 +47,7 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="com.btcminer.android.mining.ALARM_WAKEUP" />
+                <action android:name="com.btcminer.android.mining.WATCHDOG" />
             </intent-filter>
         </receiver>
         <service

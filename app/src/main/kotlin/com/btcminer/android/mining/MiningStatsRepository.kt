@@ -42,6 +42,10 @@ data class PersistedFractalChartState(
  * **Heat stop** (last 43°C hard stop: session ms + °C at stop): [setHeatStopSnapshot] / [clearHeatStopForNewSession];
  * not cleared by [saveZeros].
  *
+ * **Resume / process restart:** [setMiningRequested], [saveSessionAccumulatedHashedMs], [incrementResumeAttemptCount],
+ * share-session baselines. Cleared on user Stop / overheat / charging-constraint stop, or a manual new session.
+ * Resume count is not cleared by [saveZeros].
+ *
  * **Fractal chart** (idle restore): [saveFractalChartState] / [loadFractalChartState]; cleared by [clearFractalChartState],
  * [saveZeros], new mining session / Start Mining in UI.
  *
@@ -229,6 +233,66 @@ class MiningStatsRepository(context: Context) {
         prefs.edit()
             .putLong(KEY_HEAT_STOP_SESSION_MS, 0L)
             .putInt(KEY_HEAT_STOP_TEMP_CELSIUS_BITS, HEAT_STOP_TEMP_INACTIVE_BITS)
+            .apply()
+    }
+
+    fun isMiningRequested(): Boolean = prefs.getBoolean(KEY_MINING_REQUESTED, false)
+
+    fun setMiningRequested(requested: Boolean) {
+        prefs.edit().putBoolean(KEY_MINING_REQUESTED, requested).apply()
+    }
+
+    fun getSessionAccumulatedHashedMs(): Long = prefs.getLong(KEY_SESSION_ACCUMULATED_HASHED_MS, 0L).coerceAtLeast(0L)
+
+    fun saveSessionAccumulatedHashedMs(ms: Long) {
+        prefs.edit().putLong(KEY_SESSION_ACCUMULATED_HASHED_MS, ms.coerceAtLeast(0L)).apply()
+    }
+
+    fun getResumeAttemptCount(): Long = prefs.getLong(KEY_RESUME_ATTEMPT_COUNT, 0L).coerceAtLeast(0L)
+
+    fun incrementResumeAttemptCount(): Long {
+        val next = getResumeAttemptCount() + 1L
+        prefs.edit().putLong(KEY_RESUME_ATTEMPT_COUNT, next).apply()
+        return next
+    }
+
+    fun clearResumeAttemptCount() {
+        prefs.edit().putLong(KEY_RESUME_ATTEMPT_COUNT, 0L).apply()
+    }
+
+    data class ShareSessionBaselines(
+        val accepted: Long,
+        val rejected: Long,
+        val identified: Long,
+        val identifiedCpu: Long,
+        val identifiedGpu: Long,
+        val blockTemplates: Long,
+    )
+
+    fun saveShareSessionBaselines(baselines: ShareSessionBaselines) {
+        prefs.edit()
+            .putLong(KEY_SESSION_BASELINE_ACCEPTED, baselines.accepted.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_REJECTED, baselines.rejected.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_IDENTIFIED, baselines.identified.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_IDENTIFIED_CPU, baselines.identifiedCpu.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_IDENTIFIED_GPU, baselines.identifiedGpu.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_BLOCK_TEMPLATES, baselines.blockTemplates.coerceAtLeast(0L))
+            .apply()
+    }
+
+    fun getShareSessionBaselines(): ShareSessionBaselines = ShareSessionBaselines(
+        accepted = prefs.getLong(KEY_SESSION_BASELINE_ACCEPTED, 0L),
+        rejected = prefs.getLong(KEY_SESSION_BASELINE_REJECTED, 0L),
+        identified = prefs.getLong(KEY_SESSION_BASELINE_IDENTIFIED, 0L),
+        identifiedCpu = prefs.getLong(KEY_SESSION_BASELINE_IDENTIFIED_CPU, 0L),
+        identifiedGpu = prefs.getLong(KEY_SESSION_BASELINE_IDENTIFIED_GPU, 0L),
+        blockTemplates = prefs.getLong(KEY_SESSION_BASELINE_BLOCK_TEMPLATES, 0L),
+    )
+
+    fun clearResumeStateForNewSession() {
+        prefs.edit()
+            .putLong(KEY_RESUME_ATTEMPT_COUNT, 0L)
+            .putLong(KEY_SESSION_ACCUMULATED_HASHED_MS, 0L)
             .apply()
     }
 
@@ -609,6 +673,15 @@ class MiningStatsRepository(context: Context) {
         private const val KEY_HEAT_STOP_SESSION_MS = "heat_stop_session_ms"
         private const val KEY_HEAT_STOP_TEMP_CELSIUS_BITS = "heat_stop_temp_c_bits"
         private val HEAT_STOP_TEMP_INACTIVE_BITS = Float.NaN.toRawBits()
+        private const val KEY_MINING_REQUESTED = "mining_requested"
+        private const val KEY_SESSION_ACCUMULATED_HASHED_MS = "session_accumulated_hashed_ms"
+        private const val KEY_RESUME_ATTEMPT_COUNT = "resume_attempt_count"
+        private const val KEY_SESSION_BASELINE_ACCEPTED = "session_baseline_accepted"
+        private const val KEY_SESSION_BASELINE_REJECTED = "session_baseline_rejected"
+        private const val KEY_SESSION_BASELINE_IDENTIFIED = "session_baseline_identified"
+        private const val KEY_SESSION_BASELINE_IDENTIFIED_CPU = "session_baseline_identified_cpu"
+        private const val KEY_SESSION_BASELINE_IDENTIFIED_GPU = "session_baseline_identified_gpu"
+        private const val KEY_SESSION_BASELINE_BLOCK_TEMPLATES = "session_baseline_block_templates"
     }
 
     private fun downsampleForSnapshot(

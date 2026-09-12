@@ -33,7 +33,10 @@ class NativeMiningEngine(
     private val pendingSharesRepository: PendingSharesRepository? = null,
     private val isBothWifiAndDataUnavailable: (() -> Boolean)? = null,
     private val statsLogExtra: (() -> String)? = null,
-    private val onGpuUnavailable: (() -> Unit)? = null,
+    /** First GPU-unavailable event and then at most every [MiningConstants.GPU_RETRY_NOTIFY_INTERVAL_MS]. */
+    private val onGpuRetry: ((attempt: Int) -> Unit)? = null,
+    /** GPU pipeline became usable again after retry. */
+    private val onGpuResumed: (() -> Unit)? = null,
     /** Invoked on miner thread when session best share difficulty strictly increases. */
     private val onSessionBestDifficultyRecord: ((recordedAtMs: Long, difficulty: Double) -> Unit)? = null,
 ) : MiningEngine {
@@ -47,7 +50,7 @@ class NativeMiningEngine(
         const val GPU_SHA256_SELFTEST_LAST_ERROR = "GPU_SHA256_SELFTEST"
         /** Config has CPU cores = 0 and GPU disabled (should be blocked in UI; engine guard). */
         const val BOTH_HASHERS_DISABLED_LAST_ERROR = "BOTH_HASHERS_DISABLED"
-        /** CPU cores = 0 and GPU not usable (pipeline/init failed). */
+        /** CPU cores = 0 and GPU not configured (disabled or no Vulkan). */
         const val NO_HASHING_BACKEND_LAST_ERROR = "NO_HASHING_BACKEND"
         private const val CHUNK_SIZE = 2L * 1024 * 1024
         /** Minimum elapsed time (seconds) used as divisor for hashrate. Avoids a huge spike when "Start Mining" is clicked: dividing by a tiny elapsed time would show an inflated rate until the denominator grows. */
@@ -88,6 +91,9 @@ class NativeMiningEngine(
     private val sessionBestShareDifficultyRef = AtomicReference(0.0)
     private val gpuNoncesScanned = AtomicLong(0)
     private val gpuUnavailable = AtomicBoolean(false)
+    private val gpuWantedRef = AtomicBoolean(false)
+    private val gpuRetryNotifyLimiter = GpuRetryNotifyLimiter()
+    private val gpuRetryAttempt = AtomicLong(0)
     private val gpuWorkerExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "gpu-worker").apply { isDaemon = true }
     }
@@ -218,7 +224,14 @@ class NativeMiningEngine(
         val username = config.stratumUser.trim()
         val password = config.stratumPass
 
-        statusRef.set(MiningStatus(MiningStatus.State.Connecting, queuedShares = queuedSharesCount(null)))
+        val gpuWantedAtStart = config.gpuEnabled && GpuCapabilities.isVulkanAvailable()
+        gpuWantedRef.set(gpuWantedAtStart)
+        statusRef.set(MiningStatus(
+            MiningStatus.State.Connecting,
+            gpuWanted = gpuWantedAtStart,
+            gpuAvailable = true,
+            queuedShares = queuedSharesCount(null),
+        ))
         val port = config.stratumPort.coerceIn(1, 65535)
         val useTls = StratumPinCapture.indicatesTls(config.stratumUrl, port)
         val stratumPin = getStratumPin(host)
@@ -248,6 +261,8 @@ class NativeMiningEngine(
             MiningStatus.State.Mining,
             hashrateHs = 0.0,
             gpuHashrateHs = 0.0,
+            gpuWanted = gpuWantedRef.get(),
+            gpuAvailable = !gpuUnavailable.get(),
             noncesScanned = totalNoncesScanned.get() + gpuNoncesScanned.get(),
             acceptedShares = acceptedShares.get(),
             rejectedShares = rejectedShares.get(),
@@ -589,11 +604,7 @@ class NativeMiningEngine(
                         AppLog.d(LOG_TAG) { DeviceTelemetryReader.formatScanLine(workMs) }
                     }
                     if (scan.status == GpuNonceScanResult.UNAVAILABLE) {
-                        if (!gpuUnavailable.getAndSet(true)) {
-                            AppLog.d(LOG_TAG) { "GPU unavailable (gpuScanNoncesInto status=UNAVAILABLE)" }
-                            onGpuUnavailable?.invoke()
-                            startGpuRetryThreadIfNeeded(config)
-                        }
+                        markGpuUnavailable(config, "GPU unavailable (gpuScanNoncesInto status=UNAVAILABLE)")
                         break
                     }
                     pendingChunkStart?.let { prevStart ->
@@ -637,11 +648,7 @@ class NativeMiningEngine(
                 if (!hitShare) {
                     val flushScan = GpuNonceScanResult.fromJniOut(flushOut)
                     if (flushScan.status == GpuNonceScanResult.UNAVAILABLE) {
-                        if (!gpuUnavailable.getAndSet(true)) {
-                            AppLog.d(LOG_TAG) { "GPU unavailable (gpuPipelineFlush status=UNAVAILABLE)" }
-                            onGpuUnavailable?.invoke()
-                            startGpuRetryThreadIfNeeded(config)
-                        }
+                        markGpuUnavailable(config, "GPU unavailable (gpuPipelineFlush status=UNAVAILABLE)")
                     } else if (flushScan.status != GpuNonceScanResult.MISS) {
                         pendingChunkStart?.let { prevStart ->
                             val prevEnd = pendingChunkEnd ?: prevStart
@@ -724,20 +731,17 @@ class NativeMiningEngine(
         val threadCount = config.maxWorkerThreads.coerceIn(0, Runtime.getRuntime().availableProcessors())
         val gpuLocalSizeX = config.clampedGpuLocalSizeX(GpuCapabilities.maxLocalSizeX())
         val gpuHashesPerThread = MiningConfig.clampGpuHashesPerThread(config.gpuHashesPerThread)
-        var gpuEnabled = config.gpuEnabled && GpuCapabilities.isVulkanAvailable() && !gpuUnavailable.get()
-        if (gpuEnabled && !GpuCapabilities.pipelineReady(gpuLocalSizeX, gpuHashesPerThread, config.gpuSha256Mode.ordinal)) {
-            if (!gpuUnavailable.getAndSet(true)) {
-                AppLog.d(LOG_TAG) { "GPU init failed at startup" }
-                onGpuUnavailable?.invoke()
-                startGpuRetryThreadIfNeeded(config)
-            }
-            gpuEnabled = false
+        val gpuWanted = config.gpuEnabled && GpuCapabilities.isVulkanAvailable()
+        gpuWantedRef.set(gpuWanted)
+        if (gpuWanted && !GpuCapabilities.pipelineReady(gpuLocalSizeX, gpuHashesPerThread, config.gpuSha256Mode.ordinal)) {
+            markGpuUnavailable(config, "GPU init failed at startup")
         }
-        if (threadCount == 0 && !gpuEnabled) {
-            AppLog.e(LOG_TAG) { "No CPU workers and no usable GPU; stopping mining loop" }
+        if (threadCount == 0 && !gpuWanted) {
+            AppLog.e(LOG_TAG) { "No CPU workers and GPU not configured; stopping mining loop" }
             statusRef.set(MiningStatus(
                 MiningStatus.State.Error,
                 lastError = NO_HASHING_BACKEND_LAST_ERROR,
+                gpuWanted = false,
                 queuedShares = queuedSharesCount(client),
                 acceptedShares = acceptedShares.get(),
                 rejectedShares = rejectedShares.get(),
@@ -747,9 +751,9 @@ class NativeMiningEngine(
             ))
             return
         }
-        AppLog.d(LOG_TAG) { "Using $threadCount CPU worker(s), GPU=$gpuEnabled" }
-        val cpuRange = NonceRangePolicy.cpuRange(threadCount, gpuEnabled)
-        val gpuRange = NonceRangePolicy.gpuRange(threadCount, gpuEnabled)
+        AppLog.d(LOG_TAG) { "Using $threadCount CPU worker(s), GPU wanted=$gpuWanted unavailable=${gpuUnavailable.get()}" }
+        val cpuRange = NonceRangePolicy.cpuRange(threadCount, gpuWanted)
+        val gpuRange = NonceRangePolicy.gpuRange(threadCount, gpuWanted)
         AppLog.d(LOG_TAG) { NonceRangePolicy.formatRangeLog(cpuRange, gpuRange) }
 
         var lastReconnectAttemptMs = 0L
@@ -787,7 +791,7 @@ class NativeMiningEngine(
         }
 
         fun gpuSupervisorLoop() {
-            while (running.get() && gpuEnabled) {
+            while (running.get() && gpuWanted) {
                 if (gpuUnavailable.get()) {
                     Thread.sleep(1000)
                     continue
@@ -811,7 +815,7 @@ class NativeMiningEngine(
         if (threadCount > 0) {
             cpuSupervisorThread = Thread({ cpuSupervisorLoop() }, "cpu-supervisor").apply { isDaemon = true; start() }
         }
-        if (gpuEnabled) {
+        if (gpuWanted) {
             gpuSupervisorThread = Thread({ gpuSupervisorLoop() }, "gpu-supervisor").apply { isDaemon = true; start() }
         }
 
@@ -914,6 +918,7 @@ class NativeMiningEngine(
                 state = MiningStatus.State.Mining,
                 hashrateHs = hashrateHs,
                 gpuHashrateHs = gpuHashrateHs,
+                gpuWanted = gpuWanted,
                 gpuAvailable = !gpuUnavailable.get(),
                 noncesScanned = cpuN + gpuN,
                 acceptedShares = acceptedShares.get(),
@@ -943,6 +948,25 @@ class NativeMiningEngine(
     }
 
     /**
+     * Marks GPU unavailable, notifies UI (rate-limited), and starts the retry thread.
+     */
+    private fun markGpuUnavailable(config: MiningConfig, logMsg: String) {
+        if (!gpuUnavailable.getAndSet(true)) {
+            AppLog.d(LOG_TAG) { logMsg }
+            gpuRetryNotifyLimiter.reset()
+            gpuRetryAttempt.set(1)
+            emitGpuRetryIfDue()
+            startGpuRetryThreadIfNeeded(config)
+        }
+    }
+
+    private fun emitGpuRetryIfDue() {
+        if (gpuRetryNotifyLimiter.shouldNotify()) {
+            onGpuRetry?.invoke(gpuRetryAttempt.get().toInt().coerceAtLeast(1))
+        }
+    }
+
+    /**
      * Starts a dedicated background thread that periodically retries GPU init while GPU is unavailable.
      * The thread sleeps [MiningConstants.GPU_RETRY_INTERVAL_MS] between attempts and exits when mining stops, GPU becomes
      * available again, or a retry succeeds.
@@ -953,7 +977,6 @@ class NativeMiningEngine(
         val gpuHashesPerThread = MiningConfig.clampGpuHashesPerThread(config.gpuHashesPerThread)
         val thread = Thread({
             try {
-                var retryCount = 0
                 while (running.get() && gpuUnavailable.get()) {
                     try {
                         Thread.sleep(MiningConstants.GPU_RETRY_INTERVAL_MS)
@@ -961,18 +984,21 @@ class NativeMiningEngine(
                         break
                     }
                     if (!running.get() || !gpuUnavailable.get()) break
-                    retryCount++
-                    AppLog.d(LOG_TAG) { "GPU retry attempt #$retryCount starting" }
+                    val attempt = gpuRetryAttempt.incrementAndGet()
+                    AppLog.d(LOG_TAG) { "GPU retry attempt #$attempt starting" }
                     val available = GpuCapabilities.isVulkanAvailable() &&
                         GpuCapabilities.pipelineReady(gpuLocalSizeX, gpuHashesPerThread, config.gpuSha256Mode.ordinal)
                     if (available) {
                         gpuUnavailable.set(false)
+                        gpuRetryNotifyLimiter.reset()
                         AppLog.d(LOG_TAG) { "GPU init succeeded; resuming GPU mining" }
+                        onGpuResumed?.invoke()
                         break
                     } else {
                         AppLog.d(LOG_TAG) {
-                            "GPU init failed, retry attempt #$retryCount, will retry in ${MiningConstants.GPU_RETRY_INTERVAL_MS / 1000}s"
+                            "GPU init failed, retry attempt #$attempt, will retry in ${MiningConstants.GPU_RETRY_INTERVAL_MS / 1000}s"
                         }
+                        emitGpuRetryIfDue()
                     }
                 }
             } finally {

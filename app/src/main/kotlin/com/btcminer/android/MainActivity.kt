@@ -47,6 +47,7 @@ import com.btcminer.android.config.MiningConfigRepository
 import com.btcminer.android.databinding.ActivityMainBinding
 import com.btcminer.android.mining.DeviceTelemetryReader
 import com.btcminer.android.mining.hasFiniteTelemetryValues
+import com.btcminer.android.mining.HashRateDisplay
 import com.btcminer.android.mining.MiningConstraints
 import com.btcminer.android.mining.MiningForegroundService
 import com.btcminer.android.mining.BestDifficultyChartEvent
@@ -334,6 +335,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var miningService: MiningForegroundService? = null
+    private var gpuRetrySnackbar: Snackbar? = null
+    private val gpuRetryUiListener = object : MiningForegroundService.GpuRetryUiListener {
+        override fun onGpuRetry(attempt: Int) {
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+            if (gpuRetrySnackbar?.isShown == true) return
+            gpuRetrySnackbar = Snackbar.make(binding.root, R.string.gpu_retry_message, Snackbar.LENGTH_INDEFINITE)
+                .setAction(R.string.gpu_retry_dismiss) { gpuRetrySnackbar = null }
+            gpuRetrySnackbar?.show()
+        }
+
+        override fun onGpuResumed() {
+            gpuRetrySnackbar?.dismiss()
+            gpuRetrySnackbar = null
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+            Toast.makeText(this@MainActivity, R.string.gpu_mining_resumed, Toast.LENGTH_SHORT).show()
+        }
+    }
     private var lastBitcoinAddress: String = ""
     private val handler = Handler(Looper.getMainLooper())
     private var satoshiNormalBackdropBitmap: Bitmap? = null
@@ -809,6 +827,10 @@ class MainActivity : AppCompatActivity() {
         handler.post(pollRunnable)
         handler.post(flashRunnable)
         handler.post(mempoolFetchRunnable)
+        MiningForegroundService.gpuRetryUiListener = gpuRetryUiListener
+        if (statsRepository.isMiningRequested()) {
+            MiningForegroundService.startAsForeground(this, MiningForegroundService.ACTION_RESUME)
+        }
         bindService(
             Intent(this, MiningForegroundService::class.java),
             connection,
@@ -824,6 +846,11 @@ class MainActivity : AppCompatActivity() {
             glViewPaused = true
         }
         stopSatoshiScheduler()
+        if (MiningForegroundService.gpuRetryUiListener === gpuRetryUiListener) {
+            MiningForegroundService.gpuRetryUiListener = null
+        }
+        gpuRetrySnackbar?.dismiss()
+        gpuRetrySnackbar = null
         try {
             unbindService(connection)
         } catch (_: Exception) { }
@@ -1581,21 +1608,47 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun formatHashRateRowText(
+        status: HashRateDisplay.RowStatus,
+        rateHs: Double,
+    ): String = when (status) {
+        HashRateDisplay.RowStatus.Hashing ->
+            "${NumberFormatUtils.formatHashrateWithSpaces(rateHs)} H/s"
+        HashRateDisplay.RowStatus.Initializing -> getString(R.string.hash_rate_initializing)
+        HashRateDisplay.RowStatus.Off -> "—"
+    }
+
     private fun updateStatsUi(status: MiningStatus, service: MiningForegroundService?) {
         page1Fragment?.pageBinding?.let { p1 ->
-            val hashrateStr = if (status.state == MiningStatus.State.Mining) {
-                "${NumberFormatUtils.formatHashrateWithSpaces(status.hashrateHs)} H/s"
-            } else {
-                "— H/s"
-            }
-            p1.hashRateValue.text = hashrateStr
-            val gpuHashrateStr = when {
-                !status.gpuAvailable -> "----"
-                status.state == MiningStatus.State.Mining -> "${NumberFormatUtils.formatHashrateWithSpaces(status.gpuHashrateHs)} H/s"
-                else -> "—"
-            }
-            p1.gpuHashRateValue.text = gpuHashrateStr
             val config = configRepository.getConfig()
+            val miningRequested = service?.isMiningRequested() == true || statsRepository.isMiningRequested()
+            val startInProgress = service?.isStartInProgress() == true
+            val connectingOrResuming = HashRateDisplay.connectingOrResuming(
+                status.state,
+                miningRequested,
+                startInProgress,
+            )
+            val mining = status.state == MiningStatus.State.Mining
+            val cpuWanted = config.maxWorkerThreads > 0
+            val gpuWanted = status.gpuWanted || (config.gpuEnabled && GpuCapabilities.isVulkanAvailable())
+            p1.hashRateValue.text = formatHashRateRowText(
+                HashRateDisplay.rowStatus(
+                    backendWanted = cpuWanted,
+                    stateMining = mining,
+                    connectingOrResuming = connectingOrResuming,
+                    backendRetrying = false,
+                ),
+                status.hashrateHs,
+            )
+            p1.gpuHashRateValue.text = formatHashRateRowText(
+                HashRateDisplay.rowStatus(
+                    backendWanted = gpuWanted,
+                    stateMining = mining,
+                    connectingOrResuming = connectingOrResuming,
+                    backendRetrying = gpuWanted && !status.gpuAvailable,
+                ),
+                status.gpuHashrateHs,
+            )
             val maxCoresUi = Runtime.getRuntime().availableProcessors()
             val cpuCoresForLabel = config.maxWorkerThreads.coerceIn(0, maxCoresUi)
             p1.hashRateLabel.text = getString(R.string.hash_rate_label) + " - " + cpuCoresForLabel
@@ -1613,8 +1666,17 @@ class MainActivity : AppCompatActivity() {
                 if (config.gpuEnabled) " - ${gpuLocalSizeX}×$gpuHashesPerThread" else ""
             p1.cpuUtilizationValue.text = formatStratumDifficultyDisplay(status)
             p1.noncesValue.text = NumberFormatUtils.formatWithSpaces(status.noncesScanned)
-            val (sessionAcc, sessionRej, sessionId) = if (service != null && service.getMiningStartTimeMillis() != null) {
+            val sessionActive = service?.isSessionActiveForDisplay() == true ||
+                (service == null && statsRepository.isMiningRequested())
+            val (sessionAcc, sessionRej, sessionId) = if (sessionActive && service != null) {
                 service.getSessionShareDisplayedCounts()
+            } else if (sessionActive) {
+                val b = statsRepository.getShareSessionBaselines()
+                Triple(
+                    (status.acceptedShares - b.accepted).coerceAtLeast(0L),
+                    (status.rejectedShares - b.rejected).coerceAtLeast(0L),
+                    (status.identifiedShares - b.identified).coerceAtLeast(0L),
+                )
             } else {
                 statsRepository.getLastStoppedSessionShareDisplay()
             }
@@ -1622,14 +1684,17 @@ class MainActivity : AppCompatActivity() {
             p1.rejectedSharesValue.text = sessionRej.toString()
             p1.identifiedSharesValue.text = sessionId.toString()
             p1.queuedSharesValue.text = status.queuedShares.toString()
-            val sessionBestDiff = if (service != null && service.getMiningStartTimeMillis() != null) {
+            val sessionBestDiff = if (sessionActive && service != null) {
                 service.getSessionBestDifficultyForDisplay()
             } else {
                 statsRepository.getLastStoppedSessionBestBlockDisplay().first
             }
             p1.bestDifficultyValue.text = if (sessionBestDiff > 0.0) String.format(Locale.US, "%.6f", sessionBestDiff) else "—"
-            val sessionBlockTemplates = if (service != null && service.getMiningStartTimeMillis() != null) {
+            val sessionBlockTemplates = if (sessionActive && service != null) {
                 service.getSessionBlockTemplateDisplayedCount()
+            } else if (sessionActive) {
+                val b = statsRepository.getShareSessionBaselines()
+                (status.blockTemplates - b.blockTemplates).coerceAtLeast(0L)
             } else {
                 statsRepository.getLastStoppedSessionBestBlockDisplay().second
             }
@@ -1659,24 +1724,22 @@ class MainActivity : AppCompatActivity() {
             val status = service.getStatus()
             updateStatsUi(status, service)
             val isMining = status.state == MiningStatus.State.Mining
-            if (isMining) {
-                val cpu = service.getHashrateHistoryCpu()
-                val gpu = service.getHashrateHistoryGpu()
-                val elapsed = service.getHashrateHistoryElapsedSec()
-                val batt = service.getBatteryTempHistoryCelsius()
-                val n = minOf(cpu.size, gpu.size, elapsed.size, batt.size)
-                if (n > 0) {
-                    updateChart(cpu, gpu, elapsed, batt)
-                    updateTelemetryChartFromLive(service, elapsed)
-                } else {
-                    renderPersistedChartsOrIdleFallback()
-                }
+            val cpu = service.getHashrateHistoryCpu()
+            val gpu = service.getHashrateHistoryGpu()
+            val elapsed = service.getHashrateHistoryElapsedSec()
+            val batt = service.getBatteryTempHistoryCelsius()
+            val n = minOf(cpu.size, gpu.size, elapsed.size, batt.size)
+            if (n > 0 && (isMining || service.isSessionActiveForDisplay())) {
+                updateChart(cpu, gpu, elapsed, batt)
+                updateTelemetryChartFromLive(service, elapsed)
                 val src = service.getSessionIdentifiedShareSourceCounts()
                 if (lastDonutIdentifiedCounts != src) {
                     if (updateSharesDonutChart(src.first, src.second)) {
                         lastDonutIdentifiedCounts = src
                     }
                 }
+            } else if (isMining) {
+                renderPersistedChartsOrIdleFallback()
             } else {
                 renderPersistedChartsOrIdleFallback()
             }
@@ -1837,6 +1900,10 @@ class MainActivity : AppCompatActivity() {
             p2.lifetimeHeatStopValue.text =
                 "$tempPart - ${NumberFormatUtils.formatElapsedDdHhMmSs(heatMs)}"
         }
+
+        val resumeCount = statsRepository.getResumeAttemptCount()
+        p2.lifetimeResumedMiningValue.text =
+            if (resumeCount <= 0L) getString(R.string.heat_stop_default) else resumeCount.toString()
 
         val nbitsHex = miningService?.getCurrentStratumNbitsHex()?.trim().orEmpty()
         val netDiff =
@@ -2614,9 +2681,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun tryStartMiningService() {
         purgeFractalStateForNewMiningSession()
-        startService(Intent(this, MiningForegroundService::class.java).apply {
-            action = MiningForegroundService.ACTION_START
-        })
+        MiningForegroundService.startAsForeground(this, MiningForegroundService.ACTION_START)
     }
 
     private fun onStopMiningClicked() {

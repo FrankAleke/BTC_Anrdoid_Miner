@@ -13,6 +13,14 @@ class NonceRangePolicyTest {
     }
 
     @Test
+    fun gpuWanted_whileUnavailable_stillReservesUpperHalf() {
+        val cpu = NonceRangePolicy.cpuRange(threadCount = 4, gpuActive = true)!!
+        val gpu = NonceRangePolicy.gpuRange(threadCount = 4, gpuActive = true)!!
+        assertEquals(NonceRange(0L, 0x7FFFFFFFL), cpu)
+        assertEquals(NonceRange(0x80000000L, 0xFFFFFFFFL), gpu)
+    }
+
+    @Test
     fun gpuRange_bothActive_upperHalfNoOverlap() {
         val cpu = NonceRangePolicy.cpuRange(threadCount = 4, gpuActive = true)!!
         val gpu = NonceRangePolicy.gpuRange(threadCount = 4, gpuActive = true)!!

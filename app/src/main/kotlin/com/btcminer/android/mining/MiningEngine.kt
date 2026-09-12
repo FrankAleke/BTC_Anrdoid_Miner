@@ -52,6 +52,8 @@ data class MiningStatus(
     val state: State,
     val hashrateHs: Double = 0.0,
     val gpuHashrateHs: Double = 0.0,
+    /** True when config wants GPU and Vulkan is present (even if pipeline is still initializing). */
+    val gpuWanted: Boolean = false,
     val gpuAvailable: Boolean = true,
     val noncesScanned: Long = 0L,
     val acceptedShares: Long = 0L,

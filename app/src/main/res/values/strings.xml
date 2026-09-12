@@ -239,6 +239,11 @@
     <string name="total_mining_time_label">Total mining time</string>
     <string name="heat_stop_label">Heat stop</string>
     <string name="heat_stop_default">False</string>
+    <string name="resumed_mining_label">Resumed mining</string>
+    <string name="hash_rate_initializing">Initializing...</string>
+    <string name="gpu_retry_message">GPU init failed, retrying in the background.</string>
+    <string name="gpu_retry_dismiss">Dismiss</string>
+    <string name="gpu_mining_resumed">GPU mining resumed.</string>
     <string name="network_difficulty_label">Network difficulty</string>
     <string name="lifetime_total_hash_label">All-time total hash rate (sum of session avgs)</string>
     <string name="lifetime_total_cpu_hash_label">All-time total CPU hash rate (sum of session avgs)</string>
